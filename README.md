@@ -20,10 +20,20 @@ This repository contains the Unity source project and a synced UPM package for G
 
 ## See It In Action
 
-Particle thumbnails and the custom particle preview working together in real editor workflow:
+### 1. No More Blue Cubes
+
+Particle prefabs are much easier to recognize when the Project window shows a real animated thumbnail instead of Unity's default blue prefab cube.
 
 <p align="center">
-  <img src=".github/readme-media/particle-thumbnail-preview-showcase.gif" alt="Particle thumbnail and preview showcase" width="900" />
+  <img src=".github/readme-media/no-more-blue-cubes.gif" alt="Animated particle thumbnails in the Unity Project window" width="900" />
+</p>
+
+### 2. Better Particle Preview Controls
+
+Particle prefabs can be inspected directly in the preview window, so you do not need to open the prefab or place it in the scene just to see how the effect looks.
+
+<p align="center">
+  <img src=".github/readme-media/better-particle-preview-controls.gif" alt="Particle prefab preview controls in the Unity Inspector" width="720" />
 </p>
 
 ## Why This Tool Exists
