@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 SOURCE_ROOT="$REPO_ROOT/Assets/ParticleThumbnail&Preview"
+SOURCE_ROOT_META="$REPO_ROOT/Assets/ParticleThumbnail&Preview.meta"
 DOCS_ROOT="$SOURCE_ROOT/Documentation"
 PACKAGE_ROOT="$REPO_ROOT/upm/com.fardinhaque.particle-thumbnail-preview"
 TOOL_FOLDER_NAME="ParticleThumbnail&Preview"
@@ -38,9 +39,16 @@ if [[ -d "$DOCS_ROOT" ]]; then
     if [[ -f "$DOCS_ROOT/$doc" ]]; then
       cp "$DOCS_ROOT/$doc" "$PACKAGE_ROOT/$doc"
     fi
+    if [[ -f "$DOCS_ROOT/$doc.meta" ]]; then
+      cp "$DOCS_ROOT/$doc.meta" "$PACKAGE_ROOT/$doc.meta"
+    fi
   done
 else
   echo "Warning: documentation folder not found at $DOCS_ROOT" >&2
+fi
+
+if [[ -f "$SOURCE_ROOT_META" ]]; then
+  cp "$SOURCE_ROOT_META" "$PACKAGE_ROOT/$TOOL_FOLDER_NAME.meta"
 fi
 
 echo "UPM sync complete: $PACKAGE_ROOT"

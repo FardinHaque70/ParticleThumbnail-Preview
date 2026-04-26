@@ -22,10 +22,10 @@ This repository contains the Unity source project and a synced UPM package for G
 
 ### 1. No More Blue Cubes
 
-Particle prefabs are much easier to recognize when the Project window shows a real animated thumbnail instead of Unity's default blue prefab cube.
+Particle prefabs are much easier to recognize when the Project window shows a real static thumbnail instead of Unity's default blue prefab cube.
 
 <p align="center">
-  <img src=".github/readme-media/no-more-blue-cubes.gif" alt="Animated particle thumbnails in the Unity Project window" width="900" />
+  <img src=".github/readme-media/no-more-blue-cubes.gif" alt="Static particle thumbnails in the Unity Project window" width="900" />
 </p>
 
 ### 2. Better Particle Preview Controls
