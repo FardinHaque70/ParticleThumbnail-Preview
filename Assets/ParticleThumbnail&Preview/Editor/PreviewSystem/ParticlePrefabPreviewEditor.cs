@@ -493,8 +493,8 @@ namespace ParticleThumbnailAndPreview.Editor
             bool needsRepaint = false;
             if (_session.IsPlaying)
             {
-                _session.TickPlayback();
-                needsRepaint = true;
+                if (_session.TickPlayback())
+                    needsRepaint = true;
             }
 
             if (_session.TickInteraction())

@@ -13,10 +13,10 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp-Editor:ParticleThumbnailAndPreview.Editor:ParticlePreviewSettingsStorage
   active: 1
-  refreshFps: 45
+  refreshFps: 15
   orbitSmoothing: 15
   panSmoothing: 15
   motionPadding: 0.2
   motionRadius: 3
   motionSpeed: 60
-  backgroundColor: {r: 0.122641504, g: 0.122641504, b: 0.122641504, a: 1}
+  backgroundColor: {r: 0.11, g: 0.11, b: 0.11, a: 1}

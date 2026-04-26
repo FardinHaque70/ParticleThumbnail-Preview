@@ -1,0 +1,799 @@
+using System;
+using System.Collections.Generic;
+using UnityEditor;
+using UnityEngine;
+
+namespace ParticleThumbnailAndPreview.Editor
+{
+	[InitializeOnLoad]
+	public static class ParticleThumbnailService
+	{
+		private struct SupportCacheEntry
+		{
+			public string AssetPath;
+			public string DependencyToken;
+			public bool IsParticlePrefab;
+		}
+
+		private static readonly Dictionary<ParticleThumbnailRequest, ParticleThumbnailRecord> Cache = new();
+		private static readonly LinkedList<ParticleThumbnailRequest> CacheLru = new();
+		private static readonly Dictionary<ParticleThumbnailRequest, LinkedListNode<ParticleThumbnailRequest>> CacheLruNodes = new();
+
+		private static readonly Queue<ParticleThumbnailRequest> RenderQueue = new();
+		private static readonly HashSet<ParticleThumbnailRequest> Queued = new();
+		private static readonly Dictionary<ParticleThumbnailRequest, string> FailedDependencyByRequest = new();
+		private static readonly HashSet<string> SelectedAssetGuids = new(StringComparer.OrdinalIgnoreCase);
+		private static readonly HashSet<ParticleThumbnailRequest> GenerateAllPendingRequests = new();
+
+		private static readonly Dictionary<string, SupportCacheEntry> SupportCache = new();
+		private static string SingleSelectedAssetGuid = string.Empty;
+		private static bool GenerateAllProgressPopupVisible;
+		private static int GenerateAllTotalCount;
+		private static int GenerateAllCompletedCount;
+		private static int GenerateAllSucceededCount;
+		private static int GenerateAllFailedCount;
+
+		private const float SelectionOutlineThickness = 2f;
+		private const float SelectionOutlineInset = 2f;
+		private static readonly Color SelectionOutlineColor = new Color(0.11f, 0.84f, 0.39f, 1f);
+
+		static ParticleThumbnailService()
+		{
+			EditorApplication.projectWindowItemOnGUI += OnProjectWindowItemGui;
+			EditorApplication.update += OnEditorUpdate;
+			EditorApplication.quitting += SafeClearProgressPopup;
+			AssemblyReloadEvents.beforeAssemblyReload += SafeClearProgressPopup;
+			Selection.selectionChanged += OnSelectionChanged;
+			ParticleThumbnailSettings.SettingsChanged += HandleSettingsChanged;
+			RefreshSelectedAssetGuidCache();
+		}
+
+		public static bool IsGenerateAllInProgress
+		{
+			get
+			{
+				if (GenerateAllTotalCount <= 0)
+					return false;
+
+				return GenerateAllCompletedCount < GenerateAllTotalCount;
+			}
+		}
+
+		public static bool TryGetGenerateAllProgress(
+			out float progress01,
+			out int completed,
+			out int total,
+			out int succeeded,
+			out int failed)
+		{
+			total = GenerateAllTotalCount;
+			completed = GenerateAllCompletedCount;
+			succeeded = GenerateAllSucceededCount;
+			failed = GenerateAllFailedCount;
+
+			if (total <= 0)
+			{
+				progress01 = 0f;
+				return false;
+			}
+
+			progress01 = Mathf.Clamp01((float) completed / total);
+			return true;
+		}
+
+		public struct CacheStats
+		{
+			public int TotalEntries;
+			public int PersistentEntryCount;
+			public int GeneratingCount;
+			public int FailedCount;
+			public int QueueDepth;
+			public long MemoryCacheBytes;
+			public long DiskCacheBytes;
+		}
+
+		public static CacheStats GetCacheStats()
+		{
+			ParticleThumbnailPersistentCache.GetCachedDiskStats(out int persistentCount, out long diskBytes);
+
+			CacheStats stats = new CacheStats
+			{
+				TotalEntries = Cache.Count,
+				PersistentEntryCount = persistentCount,
+				GeneratingCount = GenerateAllPendingRequests.Count,
+				FailedCount = FailedDependencyByRequest.Count,
+				QueueDepth = RenderQueue.Count,
+				DiskCacheBytes = diskBytes,
+			};
+
+			foreach (ParticleThumbnailRecord record in Cache.Values)
+			{
+				if (record?.Texture is Texture2D texture)
+					stats.MemoryCacheBytes += (long) texture.width * texture.height * 4L;
+			}
+
+			return stats;
+		}
+
+		public static void InvalidatePath(string assetPath)
+		{
+			if (string.IsNullOrEmpty(assetPath))
+				return;
+
+			string guid = AssetDatabase.AssetPathToGUID(assetPath);
+			List<ParticleThumbnailRequest> toRemove = new List<ParticleThumbnailRequest>();
+
+			foreach (KeyValuePair<ParticleThumbnailRequest, ParticleThumbnailRecord> kv in Cache)
+			{
+				if (kv.Key.AssetPath == assetPath || (!string.IsNullOrEmpty(guid) && kv.Key.Guid == guid))
+					toRemove.Add(kv.Key);
+			}
+
+			for (int i = 0; i < toRemove.Count; i++)
+				RemoveCacheEntry(toRemove[i]);
+
+			RemoveFailedEntries(assetPath, guid);
+			RemoveQueuedEntries(assetPath, guid);
+
+			if (!string.IsNullOrEmpty(guid))
+			{
+				SupportCache.Remove(guid);
+				if (ParticleThumbnailSettings.EnablePersistentCache)
+					ParticleThumbnailPersistentCache.InvalidateGuid(guid);
+			}
+
+			EditorApplication.RepaintProjectWindow();
+		}
+
+		public static void ClearMemoryCache()
+		{
+			foreach (ParticleThumbnailRecord record in Cache.Values)
+			{
+				if (record?.Texture != null)
+					UnityEngine.Object.DestroyImmediate(record.Texture);
+			}
+
+			Cache.Clear();
+			CacheLru.Clear();
+			CacheLruNodes.Clear();
+			RenderQueue.Clear();
+			Queued.Clear();
+			FailedDependencyByRequest.Clear();
+			SupportCache.Clear();
+			ResetGenerateAllProgress();
+			SafeClearProgressPopup();
+			EditorApplication.RepaintProjectWindow();
+		}
+
+		public static void ClearPersistentCache()
+		{
+			ParticleThumbnailPersistentCache.ClearAll();
+			EditorApplication.RepaintProjectWindow();
+		}
+
+		public static void RebuildVisibleThumbnails()
+		{
+			ClearMemoryCache();
+			EditorApplication.RepaintProjectWindow();
+		}
+
+		public static void RegenerateThumbnail(string assetPath)
+		{
+			if (string.IsNullOrEmpty(assetPath))
+				return;
+
+			string guid = AssetDatabase.AssetPathToGUID(assetPath);
+			if (string.IsNullOrEmpty(guid))
+				return;
+
+			InvalidatePath(assetPath);
+			if (!TryGetParticlePrefabInfo(guid, out string validatedPath, out _))
+				return;
+
+			EnqueueAllSurfaces(guid, validatedPath);
+			EditorApplication.RepaintProjectWindow();
+		}
+
+		public static void GenerateAllThumbnailsInProject()
+		{
+			string[] prefabGuids = AssetDatabase.FindAssets("t:Prefab");
+			if (prefabGuids == null || prefabGuids.Length == 0)
+			{
+				ResetGenerateAllProgress();
+				return;
+			}
+
+			FailedDependencyByRequest.Clear();
+			ResetGenerateAllProgress();
+
+			for (int i = 0; i < prefabGuids.Length; i++)
+			{
+				string guid = prefabGuids[i];
+				if (!TryGetParticlePrefabInfo(guid, out string assetPath, out string dependencyToken))
+					continue;
+
+				for (int s = 0; s < GenerationSurfaces.Length; s++)
+				{
+					ParticleThumbnailRequest request = new ParticleThumbnailRequest(guid, assetPath, GenerationSurfaces[s]);
+					if (TryGetValidRecord(request, dependencyToken, out _))
+						continue;
+
+					TrackGenerateAllRequest(request);
+					if (!Queued.Contains(request))
+						Enqueue(request);
+				}
+			}
+
+			if (GenerateAllTotalCount > 0)
+			{
+				UpdateGenerateAllProgressPopup();
+				RepaintAllRelevantWindows();
+			}
+			else
+			{
+				ResetGenerateAllProgress();
+				SafeClearProgressPopup();
+				EditorApplication.RepaintProjectWindow();
+			}
+		}
+
+		[MenuItem("Tools/Particle Thumbnail/Clear Memory Cache")]
+		private static void MenuClearMemoryCache() => ClearMemoryCache();
+
+		[MenuItem("Tools/Particle Thumbnail/Clear Persistent Cache")]
+		private static void MenuClearPersistentCache() => ClearPersistentCache();
+
+		[MenuItem("Tools/Particle Thumbnail/Rebuild Visible Thumbnails")]
+		private static void MenuRebuildVisible() => RebuildVisibleThumbnails();
+
+		[MenuItem("Tools/Particle Thumbnail/Generate All Thumbnails")]
+		private static void MenuGenerateAll() => GenerateAllThumbnailsInProject();
+
+		[MenuItem("Assets/Particle Thumbnail/Regenerate Thumbnail", true)]
+		private static bool MenuRegenerateSelectedValidate()
+		{
+			string[] guids = Selection.assetGUIDs;
+			if (guids == null || guids.Length == 0)
+				return false;
+
+			for (int i = 0; i < guids.Length; i++)
+			{
+				if (TryGetParticlePrefabInfo(guids[i], out _, out _))
+					return true;
+			}
+
+			return false;
+		}
+
+		[MenuItem("Assets/Particle Thumbnail/Regenerate Thumbnail", false, 2000)]
+		private static void MenuRegenerateSelected()
+		{
+			string[] guids = Selection.assetGUIDs;
+			if (guids == null || guids.Length == 0)
+				return;
+
+			for (int i = 0; i < guids.Length; i++)
+			{
+				if (!TryGetParticlePrefabInfo(guids[i], out string assetPath, out _))
+					continue;
+
+				RegenerateThumbnail(assetPath);
+			}
+		}
+
+		private static readonly ParticleThumbnailSurface[] GenerationSurfaces =
+		{
+			ParticleThumbnailSurface.ProjectWindowGrid,
+			ParticleThumbnailSurface.ProjectWindowList,
+		};
+
+		private static void OnProjectWindowItemGui(string guid, Rect selectionRect)
+		{
+			if (!ParticleThumbnailSettings.Enabled)
+				return;
+
+			if (ParticleThumbnailProjectWindowUi.ShouldSkipObjectSelectorContext())
+				return;
+
+			if (!TryGetParticlePrefabInfo(guid, out string assetPath, out string dependencyToken))
+				return;
+
+			ParticleThumbnailSurface surface = ParticleThumbnailProjectWindowUi.GetSurface(selectionRect);
+			if (!ShouldDrawOnSurface(surface))
+				return;
+
+			Rect contentRect = ParticleThumbnailProjectWindowUi.GetContentRect(selectionRect, surface);
+			if (contentRect.width <= 1f || contentRect.height <= 1f)
+				return;
+
+			bool shouldDrawSelectionOutline = ShouldDrawSelectionOutline(surface, guid);
+			Rect outlineRect = shouldDrawSelectionOutline
+				? ParticleThumbnailProjectWindowUi.GetOutlineRect(selectionRect, surface)
+				: default;
+			ParticleThumbnailRequest request = new ParticleThumbnailRequest(guid, assetPath, surface);
+			if (TryGetValidRecord(request, dependencyToken, out ParticleThumbnailRecord record))
+			{
+				DrawRecord(contentRect, record.Texture);
+				if (shouldDrawSelectionOutline)
+					DrawSelectionOutline(outlineRect);
+				return;
+			}
+
+			DrawLoadingPlaceholder(contentRect);
+			if (shouldDrawSelectionOutline)
+				DrawSelectionOutline(outlineRect);
+
+			if (!IsKnownFailed(request, dependencyToken))
+				Enqueue(request);
+		}
+
+		private static void OnEditorUpdate()
+		{
+			UpdateGenerateAllProgressPopup();
+
+			if (!ParticleThumbnailSettings.Enabled)
+				return;
+
+			ProcessQueue();
+			UpdateGenerateAllProgressPopup();
+		}
+
+		private static void ProcessQueue()
+		{
+			if (RenderQueue.Count == 0)
+				return;
+
+			int maxRenders = ParticleThumbnailSettings.MaxRendersPerUpdate;
+			double budgetMs = ParticleThumbnailSettings.RenderBudgetMs;
+			double start = EditorApplication.timeSinceStartup;
+			bool anyRendered = false;
+			bool anyProgressUpdated = false;
+			int rendered = 0;
+
+			while (RenderQueue.Count > 0 && rendered < maxRenders)
+			{
+				double elapsedMs = (EditorApplication.timeSinceStartup - start) * 1000.0;
+				if (elapsedMs > budgetMs)
+					break;
+
+				ParticleThumbnailRequest request = RenderQueue.Dequeue();
+				Queued.Remove(request);
+				bool trackedByGenerateAll = GenerateAllPendingRequests.Contains(request);
+
+				if (string.IsNullOrEmpty(request.AssetPath))
+				{
+					if (trackedByGenerateAll)
+						anyProgressUpdated |= CompleteGenerateAllRequest(request, success: false);
+					continue;
+				}
+
+				string dependencyToken = GetDependencyToken(request.AssetPath);
+				if (TryGetValidRecord(request, dependencyToken, out _))
+				{
+					if (trackedByGenerateAll)
+						anyProgressUpdated |= CompleteGenerateAllRequest(request, success: true);
+					continue;
+				}
+
+				Texture2D texture = null;
+				try
+				{
+					texture = ParticleThumbnailRenderer.Render(request.AssetPath, request.Surface);
+				}
+				catch (Exception)
+				{ }
+
+				if (texture == null)
+				{
+					FailedDependencyByRequest[request] = dependencyToken;
+					if (trackedByGenerateAll)
+						anyProgressUpdated |= CompleteGenerateAllRequest(request, success: false);
+					continue;
+				}
+
+				StoreCacheRecord(request, dependencyToken, texture, persistToDisk: ParticleThumbnailSettings.EnablePersistentCache);
+				rendered++;
+				anyRendered = true;
+				if (trackedByGenerateAll)
+					anyProgressUpdated |= CompleteGenerateAllRequest(request, success: true);
+			}
+
+			if (anyRendered)
+				EditorApplication.RepaintProjectWindow();
+
+			if (anyProgressUpdated)
+				RepaintAllRelevantWindows();
+		}
+
+		private static void DrawRecord(Rect contentRect, Texture texture)
+		{
+			if (texture == null)
+				return;
+
+			EditorGUI.DrawRect(contentRect, ParticleThumbnailSettings.BackgroundColor);
+			GUI.DrawTexture(contentRect, texture, ScaleMode.ScaleToFit, true);
+		}
+
+		private static void DrawLoadingPlaceholder(Rect contentRect)
+		{
+			EditorGUI.DrawRect(contentRect, ParticleThumbnailSettings.BackgroundColor);
+			int spinIndex = (int) (EditorApplication.timeSinceStartup * 12f) % 12;
+			GUIContent spinner = EditorGUIUtility.IconContent($"WaitSpin{spinIndex:00}");
+			if (spinner?.image == null)
+				return;
+
+			float iconSize = Mathf.Clamp(Mathf.Min(contentRect.width, contentRect.height) * 0.45f, 10f, 28f);
+			Rect iconRect = new Rect(
+				contentRect.x + (contentRect.width - iconSize) * 0.5f,
+				contentRect.y + (contentRect.height - iconSize) * 0.5f,
+				iconSize,
+				iconSize);
+			GUI.DrawTexture(iconRect, spinner.image, ScaleMode.ScaleToFit, true);
+		}
+
+		private static bool ShouldDrawOnSurface(ParticleThumbnailSurface surface)
+		{
+			return surface == ParticleThumbnailSurface.ProjectWindowList
+				? ParticleThumbnailSettings.DrawInProjectList
+				: ParticleThumbnailSettings.DrawInProjectGrid;
+		}
+
+		private static bool TryGetParticlePrefabInfo(string guid, out string assetPath, out string dependencyToken)
+		{
+			assetPath = string.Empty;
+			dependencyToken = string.Empty;
+
+			if (string.IsNullOrEmpty(guid))
+				return false;
+
+			assetPath = AssetDatabase.GUIDToAssetPath(guid);
+			if (string.IsNullOrEmpty(assetPath) || !assetPath.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase))
+				return false;
+
+			dependencyToken = GetDependencyToken(assetPath);
+			if (SupportCache.TryGetValue(guid, out SupportCacheEntry cached)
+			    && cached.AssetPath == assetPath
+			    && cached.DependencyToken == dependencyToken)
+			{
+				return cached.IsParticlePrefab;
+			}
+
+			GameObject prefab = AssetDatabase.LoadAssetAtPath<GameObject>(assetPath);
+			bool isParticlePrefab = ParticleThumbnailDetection.IsParticlePrefab(prefab);
+
+			SupportCache[guid] = new SupportCacheEntry
+			{
+				AssetPath = assetPath,
+				DependencyToken = dependencyToken,
+				IsParticlePrefab = isParticlePrefab,
+			};
+
+			return isParticlePrefab;
+		}
+
+		private static string GetDependencyToken(string assetPath)
+		{
+			if (string.IsNullOrEmpty(assetPath))
+				return "0";
+
+			try
+			{
+				return AssetDatabase.GetAssetDependencyHash(assetPath).ToString();
+			}
+			catch
+			{
+				return "0";
+			}
+		}
+
+		private static bool TryGetValidRecord(ParticleThumbnailRequest request, string dependencyToken, out ParticleThumbnailRecord record)
+		{
+			if (Cache.TryGetValue(request, out record))
+			{
+				if (record != null && record.IsValid && record.DependencyToken == dependencyToken)
+				{
+					TouchLru(request);
+					return true;
+				}
+
+				RemoveCacheEntry(request);
+			}
+
+			if (!ParticleThumbnailSettings.EnablePersistentCache)
+				return false;
+
+			if (!ParticleThumbnailPersistentCache.TryLoadTexture(request, dependencyToken, out Texture2D cachedTexture))
+				return false;
+
+			StoreCacheRecord(request, dependencyToken, cachedTexture, persistToDisk: false);
+			record = Cache[request];
+			return true;
+		}
+
+		private static bool IsKnownFailed(ParticleThumbnailRequest request, string dependencyToken)
+		{
+			return FailedDependencyByRequest.TryGetValue(request, out string failedDependency)
+			       && failedDependency == dependencyToken;
+		}
+
+		private static bool ShouldDrawSelectionOutline(ParticleThumbnailSurface surface, string guid)
+		{
+			if (surface != ParticleThumbnailSurface.ProjectWindowGrid)
+				return false;
+
+			return IsGuidSelectedInProjectWindow(guid);
+		}
+
+		private static bool IsGuidSelectedInProjectWindow(string guid)
+		{
+			if (string.IsNullOrEmpty(guid))
+				return false;
+
+			if (!string.IsNullOrEmpty(SingleSelectedAssetGuid))
+				return string.Equals(SingleSelectedAssetGuid, guid, StringComparison.OrdinalIgnoreCase);
+
+			return SelectedAssetGuids.Contains(guid);
+		}
+
+		private static void DrawSelectionOutline(Rect contentRect)
+		{
+			if (contentRect.width <= 2f || contentRect.height <= 2f)
+				return;
+
+			float maxInset = Mathf.Max(0f, Mathf.Min(contentRect.width, contentRect.height) * 0.25f);
+			float inset = Mathf.Clamp(SelectionOutlineInset, 0f, maxInset);
+			Rect insetRect = new Rect(
+				contentRect.x + inset,
+				contentRect.y + inset,
+				Mathf.Max(0f, contentRect.width - inset * 2f),
+				Mathf.Max(0f, contentRect.height - inset * 2f));
+
+			if (insetRect.width <= 2f || insetRect.height <= 2f)
+				return;
+
+			float thickness = Mathf.Clamp(Mathf.Round(SelectionOutlineThickness), 1f, Mathf.Min(insetRect.width, insetRect.height) * 0.5f);
+			EditorGUI.DrawRect(new Rect(insetRect.x, insetRect.y, insetRect.width, thickness), SelectionOutlineColor);
+			EditorGUI.DrawRect(new Rect(insetRect.x, insetRect.yMax - thickness, insetRect.width, thickness), SelectionOutlineColor);
+			EditorGUI.DrawRect(new Rect(insetRect.x, insetRect.y, thickness, insetRect.height), SelectionOutlineColor);
+			EditorGUI.DrawRect(new Rect(insetRect.xMax - thickness, insetRect.y, thickness, insetRect.height), SelectionOutlineColor);
+		}
+
+		private static void EnqueueAllSurfaces(string guid, string assetPath)
+		{
+			if (string.IsNullOrEmpty(guid) || string.IsNullOrEmpty(assetPath))
+				return;
+
+			for (int s = 0; s < GenerationSurfaces.Length; s++)
+			{
+				ParticleThumbnailRequest request = new ParticleThumbnailRequest(guid, assetPath, GenerationSurfaces[s]);
+				if (!Queued.Contains(request))
+					Enqueue(request);
+			}
+		}
+
+		private static void Enqueue(ParticleThumbnailRequest request)
+		{
+			if (Queued.Contains(request))
+				return;
+
+			Queued.Add(request);
+			RenderQueue.Enqueue(request);
+		}
+
+		private static void StoreCacheRecord(ParticleThumbnailRequest request, string dependencyToken, Texture2D texture, bool persistToDisk)
+		{
+			if (texture == null)
+				return;
+
+			if (Cache.TryGetValue(request, out ParticleThumbnailRecord existing)
+			    && existing?.Texture != null
+			    && existing.Texture != texture)
+			{
+				UnityEngine.Object.DestroyImmediate(existing.Texture);
+			}
+
+			ParticleThumbnailRecord record = new ParticleThumbnailRecord
+			{
+				Guid = request.Guid,
+				AssetPath = request.AssetPath,
+				DependencyToken = dependencyToken,
+				Surface = request.Surface,
+				Texture = texture,
+			};
+
+			Cache[request] = record;
+			TouchLru(request);
+			EnforceCacheLimit();
+
+			FailedDependencyByRequest.Remove(request);
+
+			if (persistToDisk)
+				ParticleThumbnailPersistentCache.SaveTexture(request, dependencyToken, texture);
+		}
+
+		private static void TouchLru(ParticleThumbnailRequest request)
+		{
+			if (CacheLruNodes.TryGetValue(request, out LinkedListNode<ParticleThumbnailRequest> existingNode))
+			{
+				CacheLru.Remove(existingNode);
+				CacheLru.AddFirst(existingNode);
+				return;
+			}
+
+			LinkedListNode<ParticleThumbnailRequest> node = CacheLru.AddFirst(request);
+			CacheLruNodes[request] = node;
+		}
+
+		private static void EnforceCacheLimit()
+		{
+			int max = ParticleThumbnailSettings.MemoryCacheMaxEntries;
+			while (CacheLru.Count > max)
+			{
+				LinkedListNode<ParticleThumbnailRequest> tail = CacheLru.Last;
+				if (tail == null)
+					break;
+
+				RemoveCacheEntry(tail.Value);
+			}
+		}
+
+		private static void RemoveCacheEntry(ParticleThumbnailRequest request)
+		{
+			if (Cache.TryGetValue(request, out ParticleThumbnailRecord record))
+			{
+				if (record?.Texture != null)
+					UnityEngine.Object.DestroyImmediate(record.Texture);
+
+				Cache.Remove(request);
+			}
+
+			if (CacheLruNodes.TryGetValue(request, out LinkedListNode<ParticleThumbnailRequest> node))
+			{
+				CacheLru.Remove(node);
+				CacheLruNodes.Remove(request);
+			}
+		}
+
+		private static void RemoveFailedEntries(string assetPath, string guid)
+		{
+			List<ParticleThumbnailRequest> toRemove = new List<ParticleThumbnailRequest>();
+			foreach (KeyValuePair<ParticleThumbnailRequest, string> kv in FailedDependencyByRequest)
+			{
+				if (kv.Key.AssetPath == assetPath || (!string.IsNullOrEmpty(guid) && kv.Key.Guid == guid))
+					toRemove.Add(kv.Key);
+			}
+
+			for (int i = 0; i < toRemove.Count; i++)
+				FailedDependencyByRequest.Remove(toRemove[i]);
+		}
+
+		private static void RemoveQueuedEntries(string assetPath, string guid)
+		{
+			if (RenderQueue.Count == 0)
+				return;
+
+			Queue<ParticleThumbnailRequest> retained = new Queue<ParticleThumbnailRequest>(RenderQueue.Count);
+			while (RenderQueue.Count > 0)
+			{
+				ParticleThumbnailRequest request = RenderQueue.Dequeue();
+				bool remove = request.AssetPath == assetPath || (!string.IsNullOrEmpty(guid) && request.Guid == guid);
+				if (remove)
+				{
+					Queued.Remove(request);
+					CompleteGenerateAllRequest(request, success: false);
+					continue;
+				}
+
+				retained.Enqueue(request);
+			}
+
+			while (retained.Count > 0)
+				RenderQueue.Enqueue(retained.Dequeue());
+		}
+
+		private static void HandleSettingsChanged()
+		{
+			ClearMemoryCache();
+		}
+
+		private static void TrackGenerateAllRequest(ParticleThumbnailRequest request)
+		{
+			if (!GenerateAllPendingRequests.Add(request))
+				return;
+
+			GenerateAllTotalCount++;
+		}
+
+		private static bool CompleteGenerateAllRequest(ParticleThumbnailRequest request, bool success)
+		{
+			if (!GenerateAllPendingRequests.Remove(request))
+				return false;
+
+			GenerateAllCompletedCount++;
+			if (success)
+				GenerateAllSucceededCount++;
+			else
+				GenerateAllFailedCount++;
+
+			return true;
+		}
+
+		private static void ResetGenerateAllProgress()
+		{
+			GenerateAllPendingRequests.Clear();
+			GenerateAllTotalCount = 0;
+			GenerateAllCompletedCount = 0;
+			GenerateAllSucceededCount = 0;
+			GenerateAllFailedCount = 0;
+		}
+
+		private static void UpdateGenerateAllProgressPopup()
+		{
+			if (!TryGetGenerateAllProgress(
+				    out float progress01,
+				    out int completed,
+				    out int total,
+				    out int succeeded,
+				    out int failed))
+			{
+				SafeClearProgressPopup();
+				return;
+			}
+
+			if (!IsGenerateAllInProgress)
+			{
+				SafeClearProgressPopup();
+				return;
+			}
+
+			string info = $"Generated {completed}/{total}  (Succeeded: {succeeded}, Failed: {failed})";
+			EditorUtility.DisplayProgressBar("Generating Particle Thumbnails", info, progress01);
+			GenerateAllProgressPopupVisible = true;
+		}
+
+		private static void SafeClearProgressPopup()
+		{
+			if (!GenerateAllProgressPopupVisible)
+				return;
+
+			EditorUtility.ClearProgressBar();
+			GenerateAllProgressPopupVisible = false;
+		}
+
+		private static void RepaintAllRelevantWindows()
+		{
+			EditorApplication.RepaintProjectWindow();
+			UnityEditorInternal.InternalEditorUtility.RepaintAllViews();
+		}
+
+		private static void RefreshSelectedAssetGuidCache()
+		{
+			SingleSelectedAssetGuid = string.Empty;
+			SelectedAssetGuids.Clear();
+
+			string[] selectedAssetGuids = Selection.assetGUIDs;
+			if (selectedAssetGuids == null || selectedAssetGuids.Length == 0)
+				return;
+
+			if (selectedAssetGuids.Length == 1)
+			{
+				SingleSelectedAssetGuid = selectedAssetGuids[0] ?? string.Empty;
+				return;
+			}
+
+			for (int i = 0; i < selectedAssetGuids.Length; i++)
+			{
+				string selectedGuid = selectedAssetGuids[i];
+				if (!string.IsNullOrEmpty(selectedGuid))
+					SelectedAssetGuids.Add(selectedGuid);
+			}
+		}
+
+		private static void OnSelectionChanged()
+		{
+			RefreshSelectedAssetGuidCache();
+			if (ParticleThumbnailSettings.Enabled && ParticleThumbnailSettings.DrawInProjectGrid)
+				EditorApplication.RepaintProjectWindow();
+		}
+	}
+}

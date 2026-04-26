@@ -85,6 +85,7 @@ namespace ParticleThumbnailAndPreview.Editor
 
 		private double _lastUpdateTime = -1d;
 		private double _lastInteractionUpdateTime = -1d;
+		private double _playbackAccumulatorSeconds;
 		private float _playbackTime;
 
 		private static Mesh s_gridMesh;
@@ -218,6 +219,7 @@ namespace ParticleThumbnailAndPreview.Editor
 			}
 
 			_lastUpdateTime = -1d;
+			_playbackAccumulatorSeconds = 0d;
 			_lastInteractionUpdateTime = -1d;
 			_prefabInstanceId = instanceId;
 			_prefabAssetPath = assetPath;
@@ -238,6 +240,7 @@ namespace ParticleThumbnailAndPreview.Editor
 			_playing = false;
 			_playbackTime = 0f;
 			_lastUpdateTime = -1d;
+			_playbackAccumulatorSeconds = 0d;
 			_hasLoopingSystem = false;
 			_maxPlaybackTime = 5f;
 			_intensityProfile = Array.Empty<float>();
@@ -336,13 +339,17 @@ namespace ParticleThumbnailAndPreview.Editor
 
 			_playing = playing;
 			if (_playing)
+			{
 				_lastUpdateTime = -1d;
+				_playbackAccumulatorSeconds = 0d;
+			}
 		}
 
 		internal void Restart()
 		{
 			RestartInternal();
 			_lastUpdateTime = -1d;
+			_playbackAccumulatorSeconds = 0d;
 		}
 
 		internal void SetGridEnabled(bool enabled)
@@ -364,32 +371,46 @@ namespace ParticleThumbnailAndPreview.Editor
 
 			_playbackTime = clamped;
 			_lastUpdateTime = -1d;
+			_playbackAccumulatorSeconds = 0d;
 			_playing = restorePlaying;
 		}
 
-		internal void TickPlayback()
+		internal bool TickPlayback()
 		{
 			if (!IsReady || !_playing || _particleSystems.Count == 0)
-				return;
+				return false;
 
 			double now = EditorApplication.timeSinceStartup;
 			if (_lastUpdateTime < 0d)
 			{
 				_lastUpdateTime = now;
-				return;
+				_playbackAccumulatorSeconds = 0d;
+				return false;
 			}
 
 			float dt = Mathf.Clamp((float) (now - _lastUpdateTime), 0f, MaxDeltaTime);
 			_lastUpdateTime = now;
 			if (dt <= 0f)
-				return;
+				return false;
 
-			float maxFrameDt = 1f / Mathf.Max(1, ParticlePreviewSettings.RefreshFps);
-			dt = Mathf.Min(dt, maxFrameDt * 2f);
-			SimulateStep(dt);
+			double frameInterval = 1.0 / Mathf.Max(1, ParticlePreviewSettings.RefreshFps);
+			_playbackAccumulatorSeconds = Math.Min(_playbackAccumulatorSeconds + dt, frameInterval * 8.0);
+			if (_playbackAccumulatorSeconds < frameInterval)
+				return false;
+
+			int stepCount = Math.Min(4, (int) (_playbackAccumulatorSeconds / frameInterval));
+			if (stepCount <= 0)
+				return false;
+
+			for (int i = 0; i < stepCount; i++)
+				SimulateStep((float) frameInterval);
+
+			_playbackAccumulatorSeconds -= frameInterval * stepCount;
 
 			if (!_hasLoopingSystem && _playbackTime >= _maxPlaybackTime)
 				RestartInternal();
+
+			return true;
 		}
 
 		#endregion

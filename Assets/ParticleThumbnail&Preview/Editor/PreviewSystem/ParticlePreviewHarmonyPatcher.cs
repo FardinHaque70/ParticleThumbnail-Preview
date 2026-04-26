@@ -17,7 +17,8 @@ namespace ParticleThumbnailAndPreview.Editor
         private const string HarmonyTypeName = "HarmonyLib.Harmony";
         private const string HarmonyMethodTypeName = "HarmonyLib.HarmonyMethod";
         private const string HarmonyAssemblyName = "0Harmony";
-        private const string HarmonyRelativePath = "Assets/ParticleThumbnail&Preview/Editor/PreviewSystem/ThirdParty/0Harmony.dll";
+        private const string HarmonyAssetsRelativePath = "Assets/ParticleThumbnail&Preview/Editor/PreviewSystem/ThirdParty/0Harmony.dll";
+        private const string HarmonyUpmRelativePath = "Packages/com.fardinhaque.particle-thumbnail-preview/ParticleThumbnail&Preview/Editor/PreviewSystem/ThirdParty/0Harmony.dll";
 
         private static readonly string[] EditorAssemblyPreferenceOrder =
         {
@@ -182,9 +183,8 @@ namespace ParticleThumbnailAndPreview.Editor
 
             try
             {
-                string projectRoot = Directory.GetCurrentDirectory();
-                string fullPath = Path.Combine(projectRoot, HarmonyRelativePath);
-                if (!File.Exists(fullPath))
+                string fullPath = TryResolveHarmonyAssemblyPath();
+                if (string.IsNullOrEmpty(fullPath))
                     return null;
 
                 Assembly assembly = Assembly.LoadFrom(fullPath);
@@ -195,6 +195,47 @@ namespace ParticleThumbnailAndPreview.Editor
                 LogWarningOnce("harmony-load-failed", $"[ParticlePreview] Failed to load Harmony assembly: {exception.Message}");
                 return null;
             }
+        }
+
+        private static string TryResolveHarmonyAssemblyPath()
+        {
+            string projectRoot = Directory.GetCurrentDirectory();
+            string[] candidateRelativePaths =
+            {
+                HarmonyAssetsRelativePath,
+                HarmonyUpmRelativePath,
+            };
+
+            for (int i = 0; i < candidateRelativePaths.Length; i++)
+            {
+                string fullPath = Path.Combine(projectRoot, candidateRelativePaths[i]);
+                if (File.Exists(fullPath))
+                    return fullPath;
+            }
+
+            string[] harmonyGuids = AssetDatabase.FindAssets("0Harmony");
+            for (int i = 0; i < harmonyGuids.Length; i++)
+            {
+                string assetPath = AssetDatabase.GUIDToAssetPath(harmonyGuids[i]);
+                if (string.IsNullOrEmpty(assetPath)
+                    || !assetPath.EndsWith("/0Harmony.dll", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                bool isKnownToolPath =
+                    assetPath.IndexOf("/ParticleThumbnail&Preview/", StringComparison.OrdinalIgnoreCase) >= 0
+                    || assetPath.IndexOf("/com.fardinhaque.particle-thumbnail-preview/", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                if (isKnownToolPath)
+                {
+                    string fullPath = Path.Combine(projectRoot, assetPath);
+                    if (File.Exists(fullPath))
+                        return fullPath;
+                }
+            }
+
+            return null;
         }
 
         private static bool TryPatchWithPrefix(MethodInfo targetMethod, string prefixMethodName)
